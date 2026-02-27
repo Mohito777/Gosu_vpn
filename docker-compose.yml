@@ -1,0 +1,60 @@
+# Docker Compose для VPN-бота
+# Запуск: docker compose up -d
+# Просмотр логов: docker compose logs -f bot
+# Остановка: docker compose down
+
+version: '3.8'
+
+services:
+  # VPN Bot
+  bot:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: vpn_bot
+    restart: unless-stopped
+    env_file:
+      - .env
+    volumes:
+      - ./logs:/opt/vpn_bot/logs
+      - ./vpn_bot.db:/opt/vpn_bot/vpn_bot.db
+    networks:
+      - vpn_network
+    depends_on:
+      - nginx
+
+  # Nginx reverse proxy
+  nginx:
+    image: nginx:alpine
+    container_name: vpn_nginx
+    restart: unless-stopped
+    ports:
+      - "80:80"
+      - "443:443"
+      - "8080:8080"  # Webhook port
+    volumes:
+      - ./nginx.conf:/etc/nginx/nginx.conf:ro
+      - ./ssl:/etc/nginx/ssl:ro
+    networks:
+      - vpn_network
+    depends_on:
+      - bot
+
+  # Certbot для SSL сертификатов
+  certbot:
+    image: certbot/certbot
+    container_name: vpn_certbot
+    volumes:
+      - ./ssl:/etc/letsencrypt
+    entrypoint: "/bin/sh -c 'trap exit TERM; while :; do certbot renew; sleep 12h & wait $${!}; done;'"
+    networks:
+      - vpn_network
+
+networks:
+  vpn_network:
+    driver: bridge
+
+volumes:
+  logs:
+  db:
+  ssl:

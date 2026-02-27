@@ -1,0 +1,50 @@
+# .dockerignore для VPN-бота
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+venv/
+ENV/
+env/
+.venv
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# Logs
+logs/*.log
+*.log
+
+# Database
+*.db
+*.db-journal
+
+# Environment
+.env
+
+# SSL
+ssl/
+
+# Docker
+Dockerfile
+docker-compose*.yml
+.dockerignore
+
+# Git
+.git/
+.gitignore
+
+# Docs
+*.md
+docs/
+
+# Tests
+tests/
+test_*.py

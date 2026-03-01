@@ -90,6 +90,13 @@ def payment_method_keyboard(plan_key: str) -> InlineKeyboardMarkup:
             callback_data=f"pay:lava:{plan_key}",
         )])
 
+    # YooMoney (if configured)
+    if config.YOUMONEY_API_KEY:
+        rows.append([InlineKeyboardButton(
+            text=f"💳 ЮMoney {plan['price_rub']} ₽",
+            callback_data=f"pay:yoomoney:{plan_key}",
+        )])
+
     # Manual payment (webhook-based generic)
     rows.append([InlineKeyboardButton(
         text=f"🏦 Перевод ({plan['price_rub']} ₽)",

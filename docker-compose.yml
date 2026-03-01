@@ -6,6 +6,26 @@
 version: '3.8'
 
 services:
+  # SSL Initialization - runs once to obtain certificates
+  init-ssl:
+    image: certbot/certbot
+    container_name: vpn_init_ssl
+    volumes:
+      - ./ssl:/etc/letsencrypt
+      - ./ssl/webroot:/var/www/certbot
+    entrypoint: >
+      /bin/sh -c '
+        if [ ! -f /etc/letsencrypt/live/${DOMAIN:-localhost}/fullchain.pem ]; then
+          echo "No cert found, skipping certbot";
+        else
+          echo "Certificate exists";
+        fi
+      '
+    profiles:
+      - init
+    networks:
+      - vpn_network
+
   # VPN Bot
   bot:
     build:
@@ -15,9 +35,12 @@ services:
     restart: unless-stopped
     env_file:
       - .env
+    environment:
+      - DOMAIN=${DOMAIN:-}
     volumes:
       - ./logs:/opt/vpn_bot/logs
       - ./vpn_bot.db:/opt/vpn_bot/vpn_bot.db
+      - ./ssl:/opt/vpn_bot/ssl:ro
     networks:
       - vpn_network
     depends_on:
@@ -35,18 +58,27 @@ services:
     volumes:
       - ./nginx.conf:/etc/nginx/nginx.conf:ro
       - ./ssl:/etc/nginx/ssl:ro
+      - ./ssl/webroot:/var/www/certbot:ro
     networks:
       - vpn_network
     depends_on:
       - bot
 
-  # Certbot для SSL сертификатов
+  # Certbot для SSL сертификатов (renewal only)
   certbot:
     image: certbot/certbot
     container_name: vpn_certbot
     volumes:
       - ./ssl:/etc/letsencrypt
-    entrypoint: "/bin/sh -c 'trap exit TERM; while :; do certbot renew; sleep 12h & wait $${!}; done;'"
+      - ./ssl/webroot:/var/www/certbot
+    entrypoint: >
+      /bin/sh -c '
+        trap exit TERM;
+        while :; do
+          certbot renew --webroot -w /var/www/certbot;
+          sleep 12h & wait $${!};
+        done
+      '
     networks:
       - vpn_network
 

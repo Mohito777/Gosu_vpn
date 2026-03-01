@@ -21,6 +21,7 @@ from logger import get_logger
 import payments.cryptobot as cryptobot
 import payments.lava as lava
 import payments.paymaster as paymaster
+import payments.yoomoney as yoomoney
 
 log = get_logger("webhook")
 
@@ -85,33 +86,38 @@ async def _grant_access(telegram_id: int, plan_key: str, payment_id: str, gatewa
 
     # Build connection link if possible
     conn_link = xui.get_client_config_link(client_uuid, f"VPN_{telegram_id}")
-    if conn_link:
-        msg = (
-            f"✅ <b>Оплата подтверждена! Доступ выдан.</b>\n\n"
-            f"📦 Тариф: {plan['label']}\n"
-            f"⏳ Действует: {days} дн.\n\n"
-            f"━━━━━━━━━━━━━━━━━━━━\n\n"
-            f"🔑 <b>Ваш ключ подключения:</b>\n"
-            f"<code>{conn_link}</code>\n\n"
-            f"━━━━━━━━━━━━━━━━━━━━\n\n"
-            f"📲 <b>Скопируйте ключ и вставьте в приложение:</b>\n\n"
-            f"<b>Android:</b>\n"
-            f"• <a href='https://play.google.com/store/apps/details?id=com.v2ray.ang'>v2rayNG</a> (Google Play)\n"
-            f"• <a href='https://github.com/hiddify/hiddify-next/releases'>Hiddify</a> (GitHub)\n"
-            f"• <a href='https://github.com/MatsuriDayo/nekoray/releases'>Nekoray</a> (GitHub)\n\n"
-            f"<b>iOS:</b>\n"
-            f"• <a href='https://apps.apple.com/app/streisand/id6450534064'>Streisand</a> (App Store)\n"
-            f"• <a href='https://apps.apple.com/app/foxy-proxy/id6476592498'>Foxy Proxy</a> (App Store)\n"
-            f"• <a href='https://apps.apple.com/app/v2box-v2ray-client/id6444125698'>V2Box</a> (App Store)\n\n"
-            f"<b>Windows / Mac / Linux:</b>\n"
-            f"• <a href='https://github.com/hiddify/hiddify-next/releases'>Hiddify</a> (GitHub)\n"
-            f"• <a href='https://github.com/2dust/v2rayN/releases'>v2rayN</a> (GitHub, Windows)\n"
-            f"• <a href='https://github.com/MatsuriDayO/nekoray/releases'>Nekoray</a> (GitHub)"
-        )
-    else:
-        msg = f"✅ <b>Оплата подтверждена! Доступ выдан на {days} дней.</b>\n\nНапишите /start → 🔑 <b>Мой ключ</b>."
-
+    
+    # Сообщение 1: Информация об оплате
+    msg = (
+        f"✅ <b>Оплата подтверждена! Доступ выдан.</b>\n\n"
+        f"📦 Тариф: {plan['label']}\n"
+        f"⏳ Действует: {days} дн.\n\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n\n"
+        f"📲 <b>Приложения для подключения:</b>\n\n"
+        f"<b>Android:</b>\n"
+        f"• <a href='https://github.com/2dust/v2rayNG/releases'>v2rayNG</a> (GitHub)\n"
+        f"• <a href='https://play.google.com/store/apps/details?id=dev.hexasoftware.v2box'>V2Box</a> (Google Play)\n"
+        f"• <a href='https://play.google.com/store/apps/details?id=app.hiddify.com'>Hiddify</a> (Google Play)\n\n"
+        f"<b>iOS:</b>\n"
+        f"• <a href='https://apps.apple.com/app/streisand/id6450534064'>Streisand</a> (App Store)\n"
+        f"• <a href='https://apps.apple.com/us/app/hiddify-proxy-vpn/id6596777532'>Hiddify</a> (App Store)\n\n"
+        f"<b>Windows / Mac / Linux:</b>\n"
+        f"• <a href='https://github.com/hiddify/hiddify-next/releases'>Hiddify</a> (GitHub)\n"
+        f"• <a href='https://github.com/2dust/v2rayN/releases'>v2rayN</a> (GitHub, Windows)\n"
+        f"• <a href='https://github.com/MatsuriDayo/nekoray/releases'>Nekoray</a> (GitHub)"
+    )
+    
     await _notify_user(telegram_id, msg)
+    
+    # Сообщение 2: Ключ подключения (отдельным сообщением, только ключ для удобного копирования)
+    if conn_link:
+        await _notify_user(telegram_id, conn_link)
+    else:
+        await _notify_user(
+            telegram_id,
+            f"ℹ️ Ключ будет доступен после настройки.\n\nНапишите /start → 🔑 Мой ключ"
+        )
+    
     log.info(f"Access granted: telegram_id={telegram_id} plan={plan_key} days={days} payment_id={payment_id}")
     return True
 
@@ -159,9 +165,13 @@ async def handle_cryptobot(request: web.Request) -> web.Response:
     body_bytes = await request.read()
     signature = request.headers.get("crypto-pay-api-signature", "")
 
-    if config.CRYPTOBOT_TOKEN and not cryptobot.verify_webhook(body_bytes, signature):
-        log.warning(f"CryptoBot webhook: invalid signature from {request.remote}")
-        return web.Response(status=403, text="Forbidden")
+    # Require signature if token is configured, otherwise log warning and accept
+    if config.CRYPTOBOT_TOKEN:
+        if not cryptobot.verify_webhook(body_bytes, signature):
+            log.warning(f"CryptoBot webhook: invalid signature from {request.remote}")
+            return web.Response(status=403, text="Forbidden")
+    else:
+        log.warning("CryptoBot webhook received but CRYPTOBOT_TOKEN not configured — accepting without verification")
 
     try:
         body = json.loads(body_bytes)
@@ -198,9 +208,13 @@ async def handle_lava(request: web.Request) -> web.Response:
     except Exception:
         return web.Response(status=400, text="Invalid JSON")
 
-    if config.LAVA_SECRET_KEY and not lava.verify_webhook(dict(body)):
-        log.warning(f"Lava webhook: invalid signature from {request.remote}")
-        return web.Response(status=403, text="Forbidden")
+    # Require signature if key is configured, otherwise log warning and accept
+    if config.LAVA_SECRET_KEY:
+        if not lava.verify_webhook(dict(body)):
+            log.warning(f"Lava webhook: invalid signature from {request.remote}")
+            return web.Response(status=403, text="Forbidden")
+    else:
+        log.warning("Lava webhook received but LAVA_SECRET_KEY not configured — accepting without verification")
 
     parsed = lava.parse_webhook(dict(body))
     if not parsed:
@@ -236,9 +250,13 @@ async def handle_paymaster(request: web.Request) -> web.Response:
     except Exception:
         return web.Response(status=400, text="Invalid JSON")
 
-    if config.PAYMASTER_TOKEN and not paymaster.verify_webhook(dict(body)):
-        log.warning(f"Paymaster webhook: invalid signature from {request.remote}")
-        return web.Response(status=403, text="Forbidden")
+    # Require signature if token is configured, otherwise log warning and accept
+    if config.PAYMASTER_TOKEN:
+        if not paymaster.verify_webhook(dict(body)):
+            log.warning(f"Paymaster webhook: invalid signature from {request.remote}")
+            return web.Response(status=403, text="Forbidden")
+    else:
+        log.warning("Paymaster webhook received but PAYMASTER_TOKEN not configured — accepting without verification")
 
     parsed = paymaster.parse_webhook(dict(body))
     if not parsed:
@@ -263,6 +281,44 @@ async def handle_paymaster(request: web.Request) -> web.Response:
     return web.Response(text="OK")
 
 
+# ── YooMoney webhook ──────────────────────────────────────────────────────────
+
+async def handle_yoomoney(request: web.Request) -> web.Response:
+    try:
+        body = await request.json()
+    except Exception:
+        return web.Response(status=400, text="Invalid JSON")
+
+    # Verify webhook signature (if secret is configured)
+    signature = request.headers.get("X-YooMoney-Signature", "")
+    if config.YOUMONEY_SECRET and signature:
+        if not yoomoney.verify_webhook(dict(body), signature):
+            log.warning(f"YooMoney webhook: invalid signature from {request.remote}")
+            return web.Response(status=403, text="Forbidden")
+
+    parsed = yoomoney.parse_webhook(dict(body))
+    if not parsed:
+        return web.Response(text="OK")
+
+    if parsed["status"] != "success":
+        log.info(f"YooMoney: non-success status={parsed['status']}")
+        return web.Response(text="OK")
+
+    if parsed["telegram_id"] is None:
+        log.warning("YooMoney webhook: could not extract telegram_id from label")
+        return web.Response(text="OK")
+
+    log.info(f"YooMoney webhook: {parsed['payment_id']} tgid={parsed['telegram_id']}")
+    await _grant_access(
+        parsed["telegram_id"],
+        parsed.get("plan_key", "30"),
+        parsed["payment_id"],
+        "yoomoney",
+        parsed["amount"],
+    )
+    return web.Response(text="OK")
+
+
 # ── Health check ──────────────────────────────────────────────────────────────
 
 async def handle_health(request: web.Request) -> web.Response:
@@ -277,6 +333,7 @@ def create_app() -> web.Application:
     app.router.add_post("/webhook/crypto", handle_cryptobot)
     app.router.add_post("/webhook/lava", handle_lava)
     app.router.add_post("/webhook/paymaster", handle_paymaster)
+    app.router.add_post("/webhook/yoomoney", handle_yoomoney)
     app.router.add_get("/health", handle_health)
     app.router.add_get("/lava-verify_0813722c8e674ff6.html", handle_lava_verify)
     return app

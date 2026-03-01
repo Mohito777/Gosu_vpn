@@ -30,8 +30,14 @@ CRYPTOBOT_NETWORK: str = os.getenv("CRYPTOBOT_NETWORK", "mainnet")
 LAVA_SHOP_ID: str = os.getenv("LAVA_SHOP_ID", "")
 LAVA_SECRET_KEY: str = os.getenv("LAVA_SECRET_KEY", "")
 
-# ── Manual payment (перевод по номеру телефона) ─────────────────────────────
-MANUAL_PAYMENT_PHONE: str = os.getenv("MANUAL_PAYMENT_PHONE", "+79615160441")
+# ── Manual payment (перевод на карту) ────────────────────────────────────────
+MANUAL_PAYMENT_PHONE: str = os.getenv("MANUAL_PAYMENT_PHONE", "4274320046311992")  # Номер карты
+YOUMONEY_URL: str = os.getenv("YOUMONEY_URL", "https://yoomoney.ru/to/410016988853881/0")  # ЮMoney визитка
+
+# ── YooMoney API ─────────────────────────────────────────────────────────────
+YOUMONEY_API_KEY: str = os.getenv("YOUMONEY_API_KEY", "")  # API ключ из кабинета ЮMoney
+YOUMONEY_SECRET: str = os.getenv("YOUMONEY_SECRET", "")  # Secret для webhook
+YOUMONEY_ACCOUNT: str = os.getenv("YOUMONEY_ACCOUNT", "410016988853881")  # Номер счёта
 
 # ── Paymaster.ru (VK Pay) ────────────────────────────────────────────────────
 PAYMASTER_TOKEN: str = os.getenv("PAYMASTER_TOKEN", "")  # Тестовый: 1744374395:TEST:...

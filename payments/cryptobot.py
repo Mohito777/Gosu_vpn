@@ -114,8 +114,6 @@ def parse_webhook(body: dict) -> Optional[dict]:
         raw_payload = inv.get("payload", "")  # e.g. "tgid:12345:plan:30"
         telegram_id = None
         plan_key = None
-        for part in raw_payload.split(":"):
-            pass
         # Parse payload format "tgid:XXXXX:plan:30"
         parts = raw_payload.split(":")
         if len(parts) == 4 and parts[0] == "tgid" and parts[2] == "plan":

@@ -14,6 +14,7 @@ Docs: https://paymaster.ru/docs/
 """
 
 import hashlib
+import hmac
 import time
 from typing import Optional
 
@@ -145,6 +146,3 @@ def parse_webhook(body: dict) -> Optional[dict]:
 
 def make_order_id(telegram_id: int, plan_key: str) -> str:
     return f"tgid_{telegram_id}_plan_{plan_key}_{int(time.time())}"
-
-
-import hmac

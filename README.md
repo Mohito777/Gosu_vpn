@@ -142,19 +142,18 @@ VPN_bot/
 ## 📱 Приложения для подключения
 
 ### Android
-- [v2rayNG](https://play.google.com/store/apps/details?id=com.v2ray.ang) — Google Play
-- [Hiddify](https://github.com/hiddify/hiddify-next/releases) — GitHub
-- [Nekoray](https://github.com/MatsuriDayo/nekoray/releases) — GitHub
+- [v2rayNG](https://github.com/2dust/v2rayNG/releases) — GitHub
+- [V2Box](https://play.google.com/store/apps/details?id=dev.hexasoftware.v2box) — Google Play
+- [Hiddify](https://play.google.com/store/apps/details?id=app.hiddify.com) — Google Play
 
 ### iOS
 - [Streisand](https://apps.apple.com/app/streisand/id6450534064) — App Store
-- [Foxy Proxy](https://apps.apple.com/app/foxy-proxy/id6476592498) — App Store
-- [V2Box](https://apps.apple.com/app/v2box-v2ray-client/id6444125698) — App Store
+- [Hiddify](https://apps.apple.com/us/app/hiddify-proxy-vpn/id6596777532) — App Store
 
 ### Windows / Mac / Linux
 - [Hiddify](https://github.com/hiddify/hiddify-next/releases) — GitHub
-- [v2rayN](https://github.com/2dust/v2rayN/releases) — GitHub
-- [Nekoray](https://github.com/MatsuriDayO/nekoray/releases) — GitHub
+- [v2rayN](https://github.com/2dust/v2rayN/releases) — GitHub (Windows)
+- [Nekoray](https://github.com/MatsuriDayo/nekoray/releases) — GitHub
 
 ## 🔒 Безопасность
 

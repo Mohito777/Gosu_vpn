@@ -1,11 +1,38 @@
 import sqlite3
 import contextlib
+import time
+import random
 from datetime import datetime, date
 from typing import Optional
 from logger import get_logger
 
 log = get_logger("database")
 DB_PATH = "vpn_bot.db"
+
+# Retry settings for database locked errors
+MAX_RETRIES = 5
+RETRY_DELAY_BASE = 0.1  # seconds
+
+
+def _execute_with_retry(db, operation, *args, **kwargs):
+    """
+    Execute a database operation with retry on 'database is locked' errors.
+    Uses exponential backoff with jitter.
+    """
+    last_exception = None
+    for attempt in range(MAX_RETRIES):
+        try:
+            return operation(*args, **kwargs)
+        except sqlite3.OperationalError as e:
+            if "database is locked" in str(e) and attempt < MAX_RETRIES - 1:
+                delay = RETRY_DELAY_BASE * (2 ** attempt) + random.uniform(0, 0.1)
+                log.warning(f"Database locked, retrying in {delay:.2f}s (attempt {attempt + 1}/{MAX_RETRIES})")
+                time.sleep(delay)
+            else:
+                last_exception = e
+                break
+    if last_exception:
+        raise last_exception
 
 
 def _connect() -> sqlite3.Connection:
@@ -21,7 +48,7 @@ def get_db():
     conn = _connect()
     try:
         yield conn
-        conn.commit()
+        _execute_with_retry(conn, conn.commit)
     except Exception:
         conn.rollback()
         raise

@@ -11,42 +11,69 @@ import config
 
 log = get_logger("middlewares")
 
+# Глобальная переменная для bot (устанавливается в bot.py)
+_bot_instance = None
+
+
+def set_bot(bot):
+    """Установить экземпляр бота для использования в middleware."""
+    global _bot_instance
+    _bot_instance = bot
+
 
 class SubscriptionMiddleware(BaseMiddleware):
     """
     Middleware для проверки подписки пользователя на канал.
     Если не подписан — блокирует доступ к функциям бота.
     """
-    
-    def __init__(self, bot):
-        self.bot = bot
-    
+
+    def __init__(self):
+        # bot берётся из глобальной переменной _bot_instance
+        pass
+
+    @property
+    def bot(self):
+        """Получить текущий экземпляр бота."""
+        return _bot_instance
+
     async def __call__(
         self,
         handler: Callable[[Message, Dict[str, Any]], Awaitable[Any]],
         event: Message | CallbackQuery,
         data: Dict[str, Any]
     ) -> Any:
-        # Пропускаем для админов
         from_user = event.from_user
+
+        # Логирование всех событий
+        log.info(f"Middleware: tg={from_user.id} username={from_user.username} event={type(event).__name__}")
+
+        # Пропускаем для админов
         if from_user.id in config.ADMIN_IDS:
+            log.info(f"Admin bypass: tg={from_user.id}")
             return await handler(event, data)
-        
+
         # Пропускаем команду /start
         if isinstance(event, Message) and event.text:
             if event.text.startswith("/start"):
+                log.info(f"/start command allowed: tg={from_user.id}")
                 return await handler(event, data)
+
+        # ВСЕ Callback query пропускаем без проверки подписки
+        # Проверка подписки только для текстовых сообщений
+        if isinstance(event, CallbackQuery):
+            log.info(f"Callback query allowed (no sub check): tg={from_user.id} data={event.data}")
+            return await handler(event, data)
+
+        # Проверяем подписку для сообщений
+        is_subscribed = await self._check_subscription(from_user.id)
+        log.info(f"Subscription check result: tg={from_user.id} subscribed={is_subscribed}")
         
-        # Проверяем подписку
-        if not await self._check_subscription(from_user.id):
-            if isinstance(event, Message):
-                await self._send_subscription_request(event)
-                return None
-            elif isinstance(event, CallbackQuery):
-                await event.answer("⚠️ Сначала подпишитесь на канал!", show_alert=True)
-                await self._send_subscription_request(event.message)
-                return None
-        
+        if not is_subscribed:
+            await self._send_subscription_request(event)
+            log.info(f"Subscription request sent: tg={from_user.id}")
+            return None
+
+        log.info(f"Subscription OK: tg={from_user.id}")
         return await handler(event, data)
     
     async def _check_subscription(self, telegram_id: int) -> bool:
@@ -78,7 +105,11 @@ class SubscriptionMiddleware(BaseMiddleware):
         """Получение статуса участника канала."""
         if not config.CHANNEL_ID or config.CHANNEL_ID == 0:
             return None
-        
+
+        if not self.bot:
+            log.warning(f"Bot instance not set, cannot check chat member for tg={telegram_id}")
+            return None
+
         try:
             return await self.bot.get_chat_member(config.CHANNEL_ID, telegram_id)
         except Exception as e:

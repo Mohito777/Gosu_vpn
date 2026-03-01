@@ -4,10 +4,12 @@
 """
 
 import asyncio
-from aiogram import F
+from aiogram import F, Router
 from aiogram.types import Message, CallbackQuery
 from aiogram.enums import ParseMode
-from aiogram.filters import Command
+from aiogram.filters import Command, StateFilter
+from aiogram.fsm.context import FSMContext
+from aiogram.fsm.state import State, StatesGroup
 import database as db
 import config
 from keyboards import (
@@ -16,8 +18,22 @@ from keyboards import (
     back_keyboard,
 )
 from logger import get_logger
+from security import (
+    security_manager,
+    cmd_block_user,
+    cmd_unblock_user,
+    cmd_blacklist_add,
+    cmd_blacklist_remove,
+    get_security_stats,
+)
 
 log = get_logger("admin")
+
+
+# ── FSM States ────────────────────────────────────────────────────────────────
+
+class MailingState(StatesGroup):
+    waiting_for_message = State()
 
 
 # ── Admin filter ──────────────────────────────────────────────────────────────
@@ -145,36 +161,46 @@ async def cmd_user(message: Message):
 
 # ── Mailing / Broadcast ───────────────────────────────────────────────────────
 
-async def show_mailing_form(call: CallbackQuery):
+async def show_mailing_form(call: CallbackQuery, state: FSMContext):
     """Показать форму рассылки."""
     if call.from_user.id not in config.ADMIN_IDS:
         await call.answer("⛔️ Доступ запрещён", show_alert=True)
         return
-    
+
     text = (
         "📩 <b>Рассылка сообщений</b>\n\n"
         "Отправьте сообщение, которое нужно разослать всем активным пользователям.\n\n"
-        "⚠️ Внимание: сообщение будет отправлено всем активным пользователям!"
+        "⚠️ Внимание: сообщение будет отправлено всем активным пользователям!\n\n"
+        "👇 Отправьте сообщение ниже (или нажмите /cancel для отмены):"
     )
     await call.message.edit_text(text, parse_mode=ParseMode.HTML, reply_markup=back_keyboard())
     await call.answer()
+    await state.set_state(MailingState.waiting_for_message)
 
 
-async def process_mailing_message(message: Message):
+async def process_mailing_message(message: Message, state: FSMContext):
     """Обработка сообщения для рассылки."""
     if message.from_user.id not in config.ADMIN_IDS:
         return
-    
-    # Проверяем, ожидает ли админ сообщение для рассылки
-    # (в реальном проекте нужно использовать FSM)
+
+    current_state = await state.get_state()
+    if current_state != MailingState.waiting_for_message:
+        return
+
     text = message.text or message.html_text
-    
+
+    # Команда отмены
+    if text.lower() in ["/cancel", "отмена"]:
+        await state.clear()
+        await message.answer("❌ Рассылка отменена")
+        return
+
     users = db.get_all_active_users()
     success_count = 0
     failed_count = 0
-    
+
     status_message = await message.answer(f"📩 Отправка рассылки... 0/{len(users)}")
-    
+
     for user in users:
         try:
             await message.bot.send_message(
@@ -186,17 +212,18 @@ async def process_mailing_message(message: Message):
         except Exception as e:
             log.error(f"Mailing failed for {user['telegram_id']}: {e}")
             failed_count += 1
-        
+
         # Обновляем статус каждые 10 сообщений
         if (success_count + failed_count) % 10 == 0:
             await status_message.edit_text(
                 f"📩 Отправка рассылки... {success_count + failed_count}/{len(users)}"
             )
         await asyncio.sleep(0.1)  # Anti-spam
-    
+
     # Логируем рассылку
     db.log_mailing(message.from_user.id, text, success_count, failed_count)
-    
+
+    await state.clear()
     await status_message.edit_text(
         f"✅ Рассылка завершена!\n\n"
         f"Успешно: {success_count}\n"
@@ -362,6 +389,11 @@ def register_admin_handlers(dp):
     dp.message(Command("promo"))(cmd_promo)
     dp.message(Command("set_channel"))(cmd_set_channel)
     dp.message(Command("set_trial_days"))(cmd_set_trial_days)
+    dp.message(Command("cancel"))(cmd_cancel_mailing)
+    dp.message(Command("block"))(cmd_block)
+    dp.message(Command("unblock"))(cmd_unblock)
+    dp.message(Command("blacklist"))(cmd_blacklist)
+    dp.message(Command("security"))(cmd_security_stats)
 
     # Callbacks
     dp.callback_query(F.data == "admin_stats")(show_admin_stats)
@@ -379,8 +411,110 @@ def register_admin_handlers(dp):
     dp.message(F.text == "⚙️ Настройки")(show_settings_from_menu)
     dp.message(F.text == "🔙 Главное меню")(cmd_admin)
 
-    # Рассылка (ловим все сообщения от админов после команды /broadcast)
-    # В реальном проекте нужно использовать FSM
+    # Mailing FSM handler - catch all messages from admins in mailing state
+    dp.message(StateFilter(MailingState.waiting_for_message))(process_mailing_message)
+
+
+# ── Cancel mailing ────────────────────────────────────────────────────────────
+
+async def cmd_cancel_mailing(message: Message, state: FSMContext):
+    """Отменить рассылку."""
+    if message.from_user.id not in config.ADMIN_IDS:
+        return
+    await state.clear()
+    await message.answer("❌ Рассылка отменена")
+
+
+# ── Security Commands ─────────────────────────────────────────────────────────
+
+async def cmd_block(message: Message):
+    """Заблокировать пользователя: /block <tg_id> [minutes]"""
+    if message.from_user.id not in config.ADMIN_IDS:
+        return
+
+    parts = message.text.split()
+    if len(parts) < 2:
+        await message.answer("Использование: /block <tg_id> [minutes]")
+        return
+
+    try:
+        telegram_id = int(parts[1])
+        duration = int(parts[2]) if len(parts) > 2 else 60
+    except ValueError:
+        await message.answer("Неверный формат. Используйте числа.")
+        return
+
+    await cmd_block_user(telegram_id, duration, f"Admin: {message.from_user.username}")
+    await message.answer(f"✅ Пользователь {telegram_id} заблокирован на {duration} мин.")
+
+
+async def cmd_unblock(message: Message):
+    """Разблокировать пользователя: /unblock <tg_id>"""
+    if message.from_user.id not in config.ADMIN_IDS:
+        return
+
+    parts = message.text.split()
+    if len(parts) < 2:
+        await message.answer("Использование: /unblock <tg_id>")
+        return
+
+    try:
+        telegram_id = int(parts[1])
+    except ValueError:
+        await message.answer("Неверный telegram_id")
+        return
+
+    await cmd_unblock_user(telegram_id)
+    await message.answer(f"✅ Пользователь {telegram_id} разблокирован")
+
+
+async def cmd_blacklist(message: Message):
+    """Управление чёрным списком: /blacklist add|remove <tg_id>"""
+    if message.from_user.id not in config.ADMIN_IDS:
+        return
+
+    parts = message.text.split()
+    if len(parts) < 3:
+        await message.answer("Использование: /blacklist add|remove <tg_id>")
+        return
+
+    action = parts[1].lower()
+    try:
+        telegram_id = int(parts[2])
+    except ValueError:
+        await message.answer("Неверный telegram_id")
+        return
+
+    if action == "add":
+        await cmd_blacklist_add(telegram_id)
+        await message.answer(f"✅ Пользователь {telegram_id} добавлен в чёрный список")
+    elif action == "remove":
+        await cmd_blacklist_remove(telegram_id)
+        await message.answer(f"✅ Пользователь {telegram_id} удалён из чёрного списка")
+    else:
+        await message.answer("Неизвестное действие. Используйте add или remove.")
+
+
+async def cmd_security_stats(message: Message):
+    """Показать статистику безопасности."""
+    if message.from_user.id not in config.ADMIN_IDS:
+        return
+
+    stats = get_security_stats()
+    text = (
+        "🛡️ <b>Статистика безопасности</b>\n\n"
+        f"👥 Всего пользователей: <b>{stats['total_users']}</b>\n"
+        f"⛔️ Заблокировано: <b>{stats['total_blocked']}</b>\n"
+        f"⚠️ Предупреждений: <b>{stats['total_warnings']}</b>\n"
+        f"📋 В чёрном списке: <b>{stats['blacklist_size']}</b>\n"
+        f"🔒 Сейчас заблокировано: <b>{stats['currently_blocked']}</b>\n\n"
+        f"<b>Нарушения по типам:</b>\n"
+    )
+
+    for vtype, count in stats.get('violations_by_type', {}).items():
+        text += f"• {vtype}: {count}\n"
+
+    await message.answer(text, parse_mode=ParseMode.HTML)
 
 
 # ── Menu button handlers ──────────────────────────────────────────────────────

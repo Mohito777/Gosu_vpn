@@ -27,9 +27,11 @@ from keyboards import (
     admin_keyboard,
 )
 from logger import get_logger
+from middlewares import SubscriptionMiddleware, set_bot as middleware_set_bot
 import payments.cryptobot as cryptobot
 import payments.lava as lava
 import payments.paymaster as paymaster
+import payments.yoomoney as yoomoney
 from webhook import create_app, set_bot as webhook_set_bot
 import scheduler
 from admin import register_admin_handlers
@@ -45,6 +47,8 @@ user_state: dict[int, dict] = {}
 
 bot: Bot = None
 dp = Dispatcher()
+
+# Middleware будут зарегистрированы после создания bot в main()
 
 
 # ── /start ────────────────────────────────────────────────────────────────────
@@ -124,59 +128,13 @@ async def show_main_menu(message: Message):
         await message.answer(greeting, reply_markup=main_menu(), parse_mode=ParseMode.HTML)
 
 
-# ── Subscription check ────────────────────────────────────────────────────────
-
-async def check_subscription(message: Message | CallbackQuery) -> bool:
-    """Проверка подписки на канал. Возвращает True если подписан или канал не настроен."""
-    telegram_id = message.from_user.id
-
-    # Админов пропускаем
-    if telegram_id in config.ADMIN_IDS:
-        return True
-
-    # Если канал не настроен — пропускаем
-    if not config.CHANNEL_ID or config.CHANNEL_ID == 0:
-        return True
-
-    # Проверяем в БД
-    if db.is_user_subscribed(telegram_id):
-        return True
-
-    # Проверяем через API (если доступно)
-    try:
-        member = await bot.get_chat_member(config.CHANNEL_ID, telegram_id)
-        if member.status in ["member", "administrator", "creator"]:
-            db.set_user_subscribed(telegram_id, True)
-            return True
-    except Exception as e:
-        log.warning(f"Subscription check error: {e}")
-        # Fail-open: если API недоступно, доверяем БД
-        return True
-
-    # Не подписан — показываем просьбу подписаться
-    channel = config.CHANNEL_USERNAME or "@shadowlink_top"
-    text = (
-        "⚠️ <b>Для доступа к функциям бота необходимо подписаться на канал</b>\n\n"
-        f"📢 Подпишитесь на наш канал: {channel}\n\n"
-        "После подписки нажмите кнопку ниже:"
-    )
-
-    if isinstance(message, Message):
-        await message.answer(text, reply_markup=subscribe_keyboard(), parse_mode=ParseMode.HTML)
-    elif isinstance(message, CallbackQuery):
-        await message.message.answer(text, reply_markup=subscribe_keyboard(), parse_mode=ParseMode.HTML)
-        await message.answer()
-
-    return False
-
-
 # ── Check subscription callback ───────────────────────────────────────────────
 
 @dp.callback_query(F.data == "check_subscribe")
 async def cb_check_subscribe(call: CallbackQuery):
     """Проверка подписки после нажатия кнопки."""
     telegram_id = call.from_user.id
-    
+
     try:
         member = await bot.get_chat_member(config.CHANNEL_ID, telegram_id)
         if member.status in ["member", "administrator", "creator"]:
@@ -186,7 +144,7 @@ async def cb_check_subscribe(call: CallbackQuery):
             return
     except Exception as e:
         log.warning(f"Subscription check error: {e}")
-    
+
     await call.answer("❌ Вы ещё не подписались. Пожалуйста, подпишитесь на канал.", show_alert=True)
 
 
@@ -194,9 +152,7 @@ async def cb_check_subscribe(call: CallbackQuery):
 
 @dp.message(F.text == "💳 Тарифы и оплата")
 async def show_plans(message: Message):
-    if not await check_subscription(message):
-        return
-
+    log.info(f"show_plans called: tg={message.from_user.id} username={message.from_user.username}")
     lines = ["<b>💳 Тарифы и оплата:</b>\n"]
     for key, plan in config.PLANS.items():
         if key == "free":
@@ -204,6 +160,7 @@ async def show_plans(message: Message):
         else:
             lines.append(f"• {plan['label']}")
     lines.append("\nВыберите тариф:")
+    log.info(f"Sending plans keyboard to: tg={message.from_user.id}")
     await message.answer("\n".join(lines), reply_markup=plans_keyboard(), parse_mode=ParseMode.HTML)
 
 
@@ -217,6 +174,7 @@ async def cmd_pay(message: Message):
 
 @dp.callback_query(F.data.startswith("plan:"))
 async def cb_plan_selected(call: CallbackQuery):
+    log.info(f"cb_plan_selected called: tg={call.from_user.id} data={call.data}")
     plan_key = call.data.split(":")[1]
     plan = config.PLANS.get(plan_key)
     if not plan:
@@ -254,12 +212,9 @@ async def cb_back_plans(call: CallbackQuery):
 
 @dp.message(F.text == "🎁 Бесплатно")
 async def free_tariff(message: Message):
-    if not await check_subscription(message):
-        return
-    
     telegram_id = message.from_user.id
     user = db.get_user(telegram_id)
-    
+
     # Проверяем, не использовал ли уже триал
     if db.has_user_used_trial(telegram_id):
         await message.answer(
@@ -308,6 +263,8 @@ async def cb_pay_method(call: CallbackQuery):
         await _pay_paymaster(call, plan, plan_key)
     elif method == "lava":
         await _pay_lava(call, plan, plan_key)
+    elif method == "yoomoney":
+        await _pay_yoomoney(call, plan, plan_key)
     elif method == "manual":
         await _pay_manual(call, plan, plan_key)
 
@@ -356,29 +313,33 @@ async def _activate_free(call: CallbackQuery, plan: dict, plan_key: str):
         referrer_bonus = config.REFERRAL_BONUS_DAYS
         db.activate_user(referrer_id, db.get_user(referrer_id)["uuid"] or xui.generate_uuid(), referrer_bonus, f"ref_bonus_{telegram_id}")
         log.info(f"Referral bonus: referrer={referrer_id} days={referrer_bonus}")
-    
+
     conn_link = xui.get_client_config_link(client_uuid, f"VPN_{telegram_id}")
 
+    # Сообщение 1: Информация об активации
     text = (
         f"✅ <b>Бесплатный тариф активирован!</b>\n\n"
         f"🎁 Вы получили 30 дней доступа.\n\n"
         f"━━━━━━━━━━━━━━━━━━━━\n\n"
-        f"🔑 <b>Ваш ключ подключения:</b>\n"
-        f"<code>{conn_link}</code>\n\n"
-        f"━━━━━━━━━━━━━━━━━━━━\n\n"
-        f"📲 <b>Скопируйте ключ и вставьте в приложение:</b>\n\n"
+        f"📲 <b>Приложения для подключения:</b>\n\n"
         f"<b>Android:</b>\n"
-        f"• <a href='https://play.google.com/store/apps/details?id=com.v2ray.ang'>v2rayNG</a> (Google Play)\n"
-        f"• <a href='https://github.com/hiddify/hiddify-next/releases'>Hiddify</a> (GitHub)\n\n"
+        f"• <a href='https://github.com/2dust/v2rayNG/releases'>v2rayNG</a> (GitHub)\n"
+        f"• <a href='https://play.google.com/store/apps/details?id=dev.hexasoftware.v2box'>V2Box</a> (Google Play)\n"
+        f"• <a href='https://play.google.com/store/apps/details?id=app.hiddify.com'>Hiddify</a> (Google Play)\n\n"
         f"<b>iOS:</b>\n"
         f"• <a href='https://apps.apple.com/app/streisand/id6450534064'>Streisand</a> (App Store)\n"
-        f"• <a href='https://apps.apple.com/app/shadowrocket/id932747118'>Shadowrocket</a> (App Store, $2.99)\n\n"
+        f"• <a href='https://apps.apple.com/us/app/hiddify-proxy-vpn/id6596777532'>Hiddify</a> (App Store)\n\n"
         f"<b>Windows / Mac / Linux:</b>\n"
         f"• <a href='https://github.com/hiddify/hiddify-next/releases'>Hiddify</a> (GitHub)\n"
         f"• <a href='https://github.com/2dust/v2rayN/releases'>v2rayN</a> (GitHub, Windows)"
     )
 
-    await call.message.edit_text(text, parse_mode=ParseMode.HTML, disable_web_page_preview=True)
+    await call.message.answer(text, parse_mode=ParseMode.HTML, disable_web_page_preview=True)
+    
+    # Сообщение 2: Ключ подключения (отдельным сообщением, только ключ для удобного копирования)
+    if conn_link:
+        await call.message.answer(conn_link)
+    
     await call.answer()
     log.info(f"Free tariff activated: tgid={telegram_id}")
 
@@ -388,7 +349,8 @@ async def _pay_crypto(call: CallbackQuery, plan: dict, plan_key: str):
         await call.answer("Крипто-оплата не настроена", show_alert=True)
         return
 
-    payload = f"tgid:{call.from_user.id}:plan:{plan_key}"
+    telegram_id = call.from_user.id
+    payload = f"tgid:{telegram_id}:plan:{plan_key}"
     invoice = cryptobot.create_invoice(
         amount=plan["price_usdt"],
         asset="USDT",
@@ -410,7 +372,7 @@ async def _pay_crypto(call: CallbackQuery, plan: dict, plan_key: str):
         parse_mode=ParseMode.HTML,
     )
     await call.answer()
-    log.info(f"CryptoBot invoice shown: tgid={call.from_user.id} plan={plan_key}")
+    log.info(f"CryptoBot invoice shown: tgid={telegram_id} plan={plan_key}")
 
 
 async def _pay_lava(call: CallbackQuery, plan: dict, plan_key: str):
@@ -418,7 +380,8 @@ async def _pay_lava(call: CallbackQuery, plan: dict, plan_key: str):
         await call.answer("Оплата через Lava не настроена", show_alert=True)
         return
 
-    order_id = lava.make_order_id(call.from_user.id, plan_key)
+    telegram_id = call.from_user.id
+    order_id = lava.make_order_id(telegram_id, plan_key)
     invoice = lava.create_invoice(
         amount=plan["price_rub"],
         order_id=order_id,
@@ -441,7 +404,7 @@ async def _pay_lava(call: CallbackQuery, plan: dict, plan_key: str):
         parse_mode=ParseMode.HTML,
     )
     await call.answer()
-    log.info(f"Lava invoice shown: tgid={call.from_user.id} plan={plan_key} order_id={order_id}")
+    log.info(f"Lava invoice shown: tgid={telegram_id} plan={plan_key} order_id={order_id}")
 
 
 async def _pay_paymaster(call: CallbackQuery, plan: dict, plan_key: str):
@@ -449,7 +412,8 @@ async def _pay_paymaster(call: CallbackQuery, plan: dict, plan_key: str):
         await call.answer("Оплата через Paymaster не настроена", show_alert=True)
         return
 
-    order_id = paymaster.make_order_id(call.from_user.id, plan_key)
+    telegram_id = call.from_user.id
+    order_id = paymaster.make_order_id(telegram_id, plan_key)
     invoice = paymaster.create_invoice(
         amount=plan["price_rub"],
         order_id=order_id,
@@ -464,7 +428,7 @@ async def _pay_paymaster(call: CallbackQuery, plan: dict, plan_key: str):
     pay_url = invoice.get("pay_url", "")
     is_test = "TEST" in config.PAYMASTER_TOKEN
     test_label = " [ТЕСТ]" if is_test else ""
-    
+
     await call.message.edit_text(
         f"💳 <b>Оплата картой / СБП (Paymaster){test_label}</b>\n\n"
         f"Тариф: {plan['label']}\n"
@@ -475,19 +439,21 @@ async def _pay_paymaster(call: CallbackQuery, plan: dict, plan_key: str):
         parse_mode=ParseMode.HTML,
     )
     await call.answer()
-    log.info(f"Paymaster invoice shown: tgid={call.from_user.id} plan={plan_key} order_id={order_id} test={is_test}")
+    log.info(f"Paymaster invoice shown: tgid={telegram_id} plan={plan_key} order_id={order_id} test={is_test}")
 
 
 async def _pay_manual(call: CallbackQuery, plan: dict, plan_key: str):
     """Manual bank transfer — user clicks 'I paid' and waits for admin/webhook confirmation."""
     user_state[call.from_user.id] = {"plan_key": plan_key, "awaiting_payment": True}
     await call.message.edit_text(
-        f"🏦 <b>Ручной перевод по номеру</b>\n\n"
+        f"💳 <b>Перевод на карту</b>\n\n"
         f"Тариф: {plan['label']}\n"
         f"Сумма: <b>{plan['price_rub']} ₽</b>\n\n"
         f"Реквизиты для оплаты:\n"
-        f"📞 <b>СБП: <code>{config.MANUAL_PAYMENT_PHONE}</code></b>\n\n"
-        f"1. Переведите сумму по номеру телефона\n"
+        f"🏦 <b>Карта: <code>{config.MANUAL_PAYMENT_PHONE}</code></b>\n\n"
+        f"💳 <b>ЮMoney:</b>\n"
+        f"<code>{config.YOUMONEY_URL}</code>\n\n"
+        f"1. Переведите сумму по карте или через ЮMoney\n"
         f"2. Нажмите кнопку «✅ Я оплатил»\n"
         f"3. Доступ будет выдан в течение нескольких минут\n\n"
         f"⚠️ В комментарии к платежу укажите: <code>{call.from_user.id}</code>",
@@ -495,6 +461,39 @@ async def _pay_manual(call: CallbackQuery, plan: dict, plan_key: str):
         parse_mode=ParseMode.HTML,
     )
     await call.answer()
+
+
+async def _pay_yoomoney(call: CallbackQuery, plan: dict, plan_key: str):
+    """YooMoney payment — cards + SBP."""
+    if not config.YOUMONEY_API_KEY:
+        await call.answer("Оплата через ЮMoney не настроена", show_alert=True)
+        return
+
+    telegram_id = call.from_user.id
+    order_id = yoomoney.make_order_id(telegram_id, plan_key)
+    invoice = yoomoney.create_invoice(
+        amount=plan["price_rub"],
+        order_id=order_id,
+        comment=plan["label"],
+        webhook_url=f"http://{config.WEBHOOK_HOST}:{config.WEBHOOK_PORT}/webhook/yoomoney",
+    )
+    if not invoice:
+        await call.message.edit_text("❌ Ошибка создания счёта ЮMoney. Попробуйте позже.")
+        await call.answer()
+        return
+
+    pay_url = invoice.get("pay_url", "")
+    await call.message.edit_text(
+        f"💳 <b>Оплата через ЮMoney</b>\n\n"
+        f"Тариф: {plan['label']}\n"
+        f"Сумма: <b>{plan['price_rub']} ₽</b>\n\n"
+        f"Нажмите кнопку ниже для оплаты.\n"
+        f"Доступ выдаётся <b>автоматически</b> после оплаты.",
+        reply_markup=_invoice_kb(pay_url),
+        parse_mode=ParseMode.HTML,
+    )
+    await call.answer()
+    log.info(f"YooMoney invoice shown: tgid={telegram_id} plan={plan_key} order_id={order_id}")
 
 
 @dp.callback_query(F.data == "paid:confirm")
@@ -522,7 +521,8 @@ async def cb_paid_confirm(call: CallbackQuery):
                 f"👤 Пользователь: @{username} (<code>{telegram_id}</code>)\n"
                 f"📦 Тариф: {plan['label']}\n"
                 f"💵 Сумма: {plan['price_rub']} ₽\n\n"
-                f"📞 Перевод по номеру: {config.MANUAL_PAYMENT_PHONE}\n\n"
+                f"🏦 Перевод на карту: {config.MANUAL_PAYMENT_PHONE}\n"
+                f"💳 ЮMoney: {config.YOUMONEY_URL}\n\n"
                 f"Для выдачи доступа:\n"
                 f"<code>/grant {telegram_id} {plan_key} manual_{telegram_id}_{int(datetime.utcnow().timestamp())}</code>",
                 parse_mode=ParseMode.HTML,
@@ -537,16 +537,13 @@ async def cb_paid_confirm(call: CallbackQuery):
 
 @dp.message(F.text == "👥 Рефералы")
 async def show_referrals(message: Message):
-    if not await check_subscription(message):
-        return
-    
     telegram_id = message.from_user.id
     referrals_count = db.get_referrals_count(telegram_id)
     referrals_list = db.get_referrals_list(telegram_id)
-    
+
     # Генерируем реферальную ссылку
     referral_link = f"https://t.me/{(await bot.get_me()).username}?start={telegram_id}"
-    
+
     text = (
         f"👥 <b>Реферальная программа</b>\n\n"
         f"Приглашайте друзей и получайте бонусы!\n\n"
@@ -572,9 +569,6 @@ async def show_referrals(message: Message):
 
 @dp.message(F.text == "📊 Статус")
 async def show_status(message: Message):
-    if not await check_subscription(message):
-        return
-
     user = db.get_user(message.from_user.id)
     if not user:
         await message.answer("Вы не зарегистрированы. Нажмите /start")
@@ -606,9 +600,6 @@ async def cmd_status(message: Message):
 
 @dp.message(F.text == "🔑 Мой ключ")
 async def show_key(message: Message):
-    if not await check_subscription(message):
-        return
-
     user = db.get_user(message.from_user.id)
     if not user or not user["active"]:
         await message.answer("❌ У вас нет активной подписки.\nНажмите 💳 Тарифы и оплата.")
@@ -620,32 +611,32 @@ async def show_key(message: Message):
         return
 
     conn_link = xui.get_client_config_link(client_uuid, f"VPN_{message.from_user.id}")
-    if conn_link:
-        text = (
-            f"🔑 <b>Ваш ключ подключения:</b>\n\n"
-            f"<code>{conn_link}</code>\n\n"
-            f"━━━━━━━━━━━━━━━━━━━━\n\n"
-            f"📲 <b>Скопируйте ключ и вставьте в приложение:</b>\n\n"
-            f"<b>Android:</b>\n"
-            f"• <a href='https://play.google.com/store/apps/details?id=com.v2ray.ang'>v2rayNG</a> (Google Play)\n"
-            f"• <a href='https://github.com/hiddify/hiddify-next/releases'>Hiddify</a> (GitHub)\n"
-            f"• <a href='https://github.com/MatsuriDayo/nekoray/releases'>Nekoray</a> (GitHub)\n\n"
-            f"<b>iOS:</b>\n"
-            f"• <a href='https://apps.apple.com/app/streisand/id6450534064'>Streisand</a> (App Store)\n"
-            f"• <a href='https://apps.apple.com/app/foxy-proxy/id6476592498'>Foxy Proxy</a> (App Store)\n"
-            f"• <a href='https://apps.apple.com/app/v2box-v2ray-client/id6444125698'>V2Box</a> (App Store)\n\n"
-            f"<b>Windows / Mac / Linux:</b>\n"
-            f"• <a href='https://github.com/hiddify/hiddify-next/releases'>Hiddify</a> (GitHub)\n"
-            f"• <a href='https://github.com/2dust/v2rayN/releases'>v2rayN</a> (GitHub, Windows)\n"
-            f"• <a href='https://github.com/MatsuriDayO/nekoray/releases'>Nekoray</a> (GitHub)"
-        )
-    else:
-        text = (
-            f"🔑 Ваш UUID: <code>{client_uuid}</code>\n\n"
-            f"Настройте клиент вручную или обратитесь в поддержку."
-        )
-
+    
+    # Сообщение 1: Приложения для подключения
+    text = (
+        f"📲 <b>Приложения для подключения:</b>\n\n"
+        f"<b>Android:</b>\n"
+        f"• <a href='https://github.com/2dust/v2rayNG/releases'>v2rayNG</a> (GitHub)\n"
+        f"• <a href='https://play.google.com/store/apps/details?id=dev.hexasoftware.v2box'>V2Box</a> (Google Play)\n"
+        f"• <a href='https://play.google.com/store/apps/details?id=app.hiddify.com'>Hiddify</a> (Google Play)\n\n"
+        f"<b>iOS:</b>\n"
+        f"• <a href='https://apps.apple.com/app/streisand/id6450534064'>Streisand</a> (App Store)\n"
+        f"• <a href='https://apps.apple.com/us/app/hiddify-proxy-vpn/id6596777532'>Hiddify</a> (App Store)\n\n"
+        f"<b>Windows / Mac / Linux:</b>\n"
+        f"• <a href='https://github.com/hiddify/hiddify-next/releases'>Hiddify</a> (GitHub)\n"
+        f"• <a href='https://github.com/2dust/v2rayN/releases'>v2rayN</a> (GitHub, Windows)\n"
+        f"• <a href='https://github.com/MatsuriDayo/nekoray/releases'>Nekoray</a> (GitHub)"
+    )
+    
     await message.answer(text, parse_mode=ParseMode.HTML, disable_web_page_preview=True)
+    
+    # Сообщение 2: Ключ подключения (отдельным сообщением, только ключ для удобного копирования)
+    if conn_link:
+        await message.answer(conn_link)
+    else:
+        await message.answer(
+            f"🔑 Ваш UUID: {client_uuid}\n\nНастройте клиент вручную или обратитесь в поддержку."
+        )
 
 
 # ── /key ──────────────────────────────────────────────────────────────────────
@@ -660,12 +651,9 @@ async def cmd_key(message: Message):
 
 @dp.message(F.text == "📊 Статистика")
 async def show_traffic_stats(message: Message):
-    if not await check_subscription(message):
-        return
-    
     telegram_id = message.from_user.id
     user = db.get_user(telegram_id)
-    
+
     if not user or not user["active"]:
         await message.answer("❌ У вас нет активной подписки.")
         return
@@ -814,35 +802,35 @@ async def cmd_grant(message: Message):
 
     # Получаем ключ подключения
     conn_link = xui.get_client_config_link(client_uuid, f"VPN_{telegram_id}")
-    
+
     # Отправляем пользователю ключ
     if conn_link:
         try:
+            # Сообщение 1: Информация
             await bot.send_message(
                 telegram_id,
                 f"✅ <b>Оплата подтверждена! Доступ выдан.</b>\n\n"
                 f"📦 Тариф: {plan['label']}\n"
                 f"⏳ Действует: {plan['days']} дн.\n\n"
                 f"━━━━━━━━━━━━━━━━━━━━\n\n"
-                f"🔑 <b>Ваш ключ подключения:</b>\n"
-                f"<code>{conn_link}</code>\n\n"
-                f"━━━━━━━━━━━━━━━━━━━━\n\n"
-                f"📲 <b>Скопируйте ключ и вставьте в приложение:</b>\n\n"
+                f"📲 <b>Приложения для подключения:</b>\n\n"
                 f"<b>Android:</b>\n"
-                f"• <a href='https://play.google.com/store/apps/details?id=com.v2ray.ang'>v2rayNG</a> (Google Play)\n"
-                f"• <a href='https://github.com/hiddify/hiddify-next/releases'>Hiddify</a> (GitHub)\n"
-                f"• <a href='https://github.com/MatsuriDayo/nekoray/releases'>Nekoray</a> (GitHub)\n\n"
+                f"• <a href='https://github.com/2dust/v2rayNG/releases'>v2rayNG</a> (GitHub)\n"
+                f"• <a href='https://play.google.com/store/apps/details?id=dev.hexasoftware.v2box'>V2Box</a> (Google Play)\n"
+                f"• <a href='https://play.google.com/store/apps/details?id=app.hiddify.com'>Hiddify</a> (Google Play)\n\n"
                 f"<b>iOS:</b>\n"
                 f"• <a href='https://apps.apple.com/app/streisand/id6450534064'>Streisand</a> (App Store)\n"
-                f"• <a href='https://apps.apple.com/app/foxy-proxy/id6476592498'>Foxy Proxy</a> (App Store)\n"
-                f"• <a href='https://apps.apple.com/app/v2box-v2ray-client/id6444125698'>V2Box</a> (App Store)\n\n"
+                f"• <a href='https://apps.apple.com/us/app/hiddify-proxy-vpn/id6596777532'>Hiddify</a> (App Store)\n\n"
                 f"<b>Windows / Mac / Linux:</b>\n"
                 f"• <a href='https://github.com/hiddify/hiddify-next/releases'>Hiddify</a> (GitHub)\n"
                 f"• <a href='https://github.com/2dust/v2rayN/releases'>v2rayN</a> (GitHub, Windows)\n"
-                f"• <a href='https://github.com/MatsuriDayO/nekoray/releases'>Nekoray</a> (GitHub)",
+                f"• <a href='https://github.com/MatsuriDayo/nekoray/releases'>Nekoray</a> (GitHub)",
                 parse_mode=ParseMode.HTML,
                 disable_web_page_preview=True,
             )
+            
+            # Сообщение 2: Ключ подключения (отдельным сообщением, только ключ для удобного копирования)
+            await bot.send_message(telegram_id, conn_link)
         except Exception as e:
             log.error(f"Failed to send key to user {telegram_id}: {e}")
             await bot.send_message(telegram_id, "✅ Доступ выдан! Напишите /key чтобы получить ключ.")
@@ -944,8 +932,9 @@ async def main():
     global bot
     bot = Bot(token=config.BOT_TOKEN)
 
-    # Inject bot into webhook & scheduler
+    # Inject bot into webhook, scheduler, and middlewares
     webhook_set_bot(bot)
+    middleware_set_bot(bot)
     scheduler.start(bot)
 
     # Login to 3x-ui
@@ -954,6 +943,10 @@ async def main():
 
     # Register admin handlers
     register_admin_handlers(dp)
+
+    # Register middlewares (after bot is created!)
+    dp.message.middleware(SubscriptionMiddleware())
+    dp.callback_query.middleware(SubscriptionMiddleware())
 
     # Start aiohttp webhook server alongside aiogram
     webhook_app = create_app()
